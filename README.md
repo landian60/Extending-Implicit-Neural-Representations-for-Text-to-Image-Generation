@@ -1,0 +1,1 @@
+# Extending-Implicit-Neural-Representations-for-Text-to-Image-Generation
