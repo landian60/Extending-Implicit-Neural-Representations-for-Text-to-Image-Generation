@@ -1,13 +1,3 @@
-##### Table of contents
-1. [Requirements](#requirements)
-2. [Getting Started](#getting-started)
-3. [Using Networks from Python](#using-networks-from-python)
-4. [Preparing Datasets](#preparing-datasets)
-5. [Training](#training)
-6. [Quality Metrics](#quality-metrics)
-7. [Model Checkpoints](#model-checkpoints)
-8. [Acknowledgements](#acknowledgements)
-
 # Extending Implicit Neural Representations for Text-to-Image Generation
 <a href="https://doi.org/10.1109/ICASSP48485.2024.10446171"><img src="https://img.shields.io/badge/DOI-10.1109%2FICASSP48485.2024.10446171-blue?style=for-the-badge"></a>
 <a href="./LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-green?style=for-the-badge"></a>
@@ -43,6 +33,16 @@ Details of the model architecture and experimental results can be found in [our 
 ```
 
 **Please CITE** this paper whenever the code or model design helps produce published results or derivative software.
+
+##### Table of contents
+1. [Requirements](#requirements)
+2. [Getting Started](#getting-started)
+3. [Using Networks from Python](#using-networks-from-python)
+4. [Preparing Datasets](#preparing-datasets)
+5. [Training](#training)
+6. [Quality Metrics](#quality-metrics)
+7. [Model Checkpoints](#model-checkpoints)
+8. [Acknowledgements](#acknowledgements)
 
 ## Additional material
 
