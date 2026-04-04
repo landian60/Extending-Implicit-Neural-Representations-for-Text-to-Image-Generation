@@ -12,13 +12,23 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_utils import misc, persistence
 from torch_utils.ops import bias_act, upfirdn2d, conv2d_resample
-from torch_utils.op import upfirdn2d as upfirdn2d_op
 from training.attn_layer import TransformerLayer, EqualLinear, TransformerBlock, MLP
 from training.attn_layer import normalize, torch_misc, get_global, get_components
 from training.attn_layer import DFBLK, get_positional_encoding
 from training.positional_encoding import ScalePartyPE, simple_norm, decompose_simple_2d, compose_simple_2d, decompose_simple_1d, compose_simple_1d
 import dnnlib
 import legacy
+
+
+def upfirdn2d_op(input, kernel, up=1, down=1, pad=(0, 0)):
+    return upfirdn2d.upfirdn2d(
+        input,
+        kernel,
+        up=up,
+        down=down,
+        padding=pad,
+        impl="ref" if input.device.type == "cpu" else "cuda",
+    )
 
 # ----------------------------------------------------------------------------
 SLOPE = 0.2
@@ -367,6 +377,41 @@ def modulated_spectral_fc(
     x = torch.einsum("nihw, noi -> nohw", x, w.to(x.dtype))
     return x
 
+
+@misc.profiled_function
+def modulated_spectral_fc_legacy(
+    x,
+    weight,
+    styles,
+    styles2,
+    demodulate=True,
+):
+    batch_size = x.shape[0]
+    out_channels, in_channels = weight.shape
+    dtype = x.dtype
+    misc.assert_shape(weight, [out_channels, in_channels])
+    misc.assert_shape(x, [batch_size, in_channels, None, None])
+    misc.assert_shape(styles, [batch_size, in_channels])
+    misc.assert_shape(styles2, [batch_size, in_channels])
+
+    if x.dtype == torch.float16 and demodulate:
+        weight = weight * (1 / np.sqrt(in_channels) / weight.norm(float("inf"), dim=[1], keepdim=True))
+        styles = styles / styles.norm(float("inf"), dim=1, keepdim=True)
+
+    styles2 = styles2.unsqueeze(-1).unsqueeze(-1).reshape(batch_size, in_channels, 1, 1).to(torch.float32)
+    x = torch.fft.rfft2(x.to(torch.float32), dim=[2, 3], norm="ortho")
+    x = torch.fft.irfft2(torch.abs(x) * styles2 * torch.exp(1j * torch.angle(x)), dim=[2, 3], norm="ortho")
+    x = x.to(dtype)
+
+    w = weight.unsqueeze(0).repeat(x.shape[0], 1, 1)
+    w = w * styles.unsqueeze(1)
+    if demodulate:
+        dcoefs = (w.square().sum(dim=[2]) + 1e-8).rsqrt()
+        w = w * dcoefs.unsqueeze(2)
+
+    x = torch.einsum("nihw, noi -> nohw", x, w.to(x.dtype))
+    return x
+
 # ----------------------------------------------------------------------------
 
 
@@ -437,6 +482,7 @@ class MappingNetwork(torch.nn.Module):
         normalize_global  = True,     # Normalize the input global latent 
                                       # (True is recommended. The flag is introduced for backwards compatibility)
         use_pos           = False,    # Use positional encoding for latents
+        arch_version      = "current",
         **transformer_kwargs          # Arguments for Attn
     ):
 
@@ -451,6 +497,8 @@ class MappingNetwork(torch.nn.Module):
         self.w_avg_beta = w_avg_beta
         self.normalize_global = normalize_global
         self.use_pos = use_pos
+        self.arch_version = arch_version
+        assert self.arch_version in ["current", "legacy"]
 
         layer_dim = layer_dim or w_dim
         embed_dim = (embed_dim or z_dim) if (c_dim > 0 or fts_dim > 0) else 0
@@ -458,9 +506,11 @@ class MappingNetwork(torch.nn.Module):
         if c_dim > 0:
             self.embed = FullyConnectedLayer(c_dim, embed_dim)
         if fts_dim > 0:
-            self.fsts_embed = FullyConnectedLayer(fts_dim, embed_dim, activation='lrelu', lr_multiplier=0.01)
-            # self.fsts_embed = FullyConnectedLayer(fts_dim+z_dim, embed_dim, activation='lrelu', lr_multiplier=0.01)
-            if k != 1:
+            if self.arch_version == "legacy":
+                self.fsts_embed = FullyConnectedLayer(fts_dim, embed_dim)
+            else:
+                self.fsts_embed = FullyConnectedLayer(fts_dim, embed_dim, activation='lrelu', lr_multiplier=0.01)
+            if self.arch_version == "legacy" or k != 1:
                 ta_kwargs = {
                     "from_len":  77,     "to_len":  77,         # The from/to tensor lengths
                     "from_dim":  fts_dim,                "to_dim":  fts_dim,         # The from/to tensor dimensions
@@ -471,11 +521,13 @@ class MappingNetwork(torch.nn.Module):
                     }
                 ta_kwargs.update(transformer_kwargs)
                 ca_kwargs.update(transformer_kwargs)
-                self.text_attn = TransformerLayer(dim = fts_dim, modulate = False, **ta_kwargs)
-                # self.cross_attn = TransformerLayer(dim = w_dim, modulate = False, **ca_kwargs)
+                if self.arch_version == "legacy":
+                    ta_kwargs["pos_dim"] = ta_kwargs.get("pos_dim") or fts_dim
+                    ca_kwargs["pos_dim"] = ca_kwargs.get("pos_dim") or w_dim
+                    self.text_attn = TransformerLayer(dim = fts_dim, **ta_kwargs)
+                else:
+                    self.text_attn = TransformerLayer(dim = fts_dim, modulate = False, **ta_kwargs)
                 self.cross_attn = TransformerLayer(dim = w_dim, **ca_kwargs)
-            # self.text_attn = TransformerLayer(dim = fts_dim, pos_dim=fts_dim, **ta_kwargs)
-            # self.cross_attn = TransformerLayer(dim = w_dim, pos_dim=w_dim,**ca_kwargs)
 
         sa_kwargs = {
            "sa": ltnt2ltnt and not shared,   "batch":   not shared,
@@ -486,8 +538,10 @@ class MappingNetwork(torch.nn.Module):
 
         layers = [layer_dim] * (num_layers - 1) + [w_dim]
 
-        self.global_mlp = MLP([z_dim] * (num_layers + 1), act = act, resnet = False, lrmul = lrmul)
-        # self.global_mlp = MLP([z_dim + embed_dim] + layers, act = act, resnet = False, lrmul = lrmul)
+        if self.arch_version == "legacy":
+            self.global_mlp = MLP([z_dim + embed_dim] + layers, act = act, resnet = False, lrmul = lrmul)
+        else:
+            self.global_mlp = MLP([z_dim] * (num_layers + 1), act = act, resnet = False, lrmul = lrmul)
         if transformer:
             self.mlp = MLP([z_dim] + layers, act = act, resnet = resnet, lrmul = lrmul, **sa_kwargs)
 
@@ -505,7 +559,10 @@ class MappingNetwork(torch.nn.Module):
                 z, g = torch.split(z, [self.k - 1, 1], dim = 1)
                 if self.normalize_global: 
                     g = normalize(g)
-                    
+                if self.arch_version == "legacy" and fts is not None and self.fts_dim > 0:
+                    torch_misc.assert_shape(fts, [None, 77, self.fts_dim])
+                    fts_,_,_ = self.text_attn(from_tensor = fts,  to_tensor = fts, from_pos=None,to_pos=None)
+                    z,_,_ = self.cross_attn(from_tensor = z,  to_tensor = fts_, from_pos=None,to_pos=None)
             z = normalize(z)
             x = g if self.transformer else z
             
@@ -514,7 +571,11 @@ class MappingNetwork(torch.nn.Module):
                 y = self.embed(c.to(torch.float32))
                 y = normalize(y)
                 x = torch.cat([x, y.unsqueeze(1)], dim = -1)
-
+            if self.arch_version == "legacy" and self.fts_dim > 0:
+                misc.assert_shape(fsts, [None,self.fts_dim])
+                y = self.fsts_embed(fsts.to(torch.float32))
+                y = normalize(y)
+                x = torch.cat([x, y.unsqueeze(1)], dim = -1)
 
         if mask is not None:
             torch_misc.assert_shape(mask, [None, self.k - 1])
@@ -523,20 +584,17 @@ class MappingNetwork(torch.nn.Module):
 
         # Main layers
         x = self.global_mlp(x)
-        if self.fts_dim > 0 and self.transformer:
+        if self.arch_version != "legacy" and self.fts_dim > 0 and self.transformer:
             misc.assert_shape(fsts, [None,self.fts_dim])
             y = self.fsts_embed(fsts.to(torch.float32))
-            # y = self.fsts_embed(torch.cat([x.squeeze(1), fsts.to(torch.float32)], dim = -1))
             y = normalize(y)
-            # x = normalize(y).unsqueeze(1)
             x = torch.cat([x, y.unsqueeze(1)], dim = -1)
         if self.transformer:
             p = self.mlp(z, pos = pos if self.use_pos else None, mask = mask)
-            if fts is not None and self.fts_dim > 0:
+            if self.arch_version != "legacy" and fts is not None and self.fts_dim > 0:
                 torch_misc.assert_shape(fts, [None, 77, self.fts_dim])
                 fts_,_,_ = self.text_attn(from_tensor = fts,  to_tensor = fts, from_pos=None,to_pos=None)
                 p,_,_ = self.cross_attn(from_tensor = p,  to_tensor = fts_, from_pos=None,to_pos=None)
-                # z = torch.cat([z,fts],dim=1)
             x = torch.cat([p, x], dim = 1)
 
         # Update moving average of W
@@ -687,6 +745,7 @@ class SynthesisLayer(torch.nn.Module):
         channel_attn = False,
         spectral_weight = False,
         rank_attn = False,
+        arch_version = "current",
         **transformer_kwargs          # Arguments for Attn
     ):
         super().__init__()
@@ -703,6 +762,8 @@ class SynthesisLayer(torch.nn.Module):
         self.channel_attn = channel_attn
         self.spectral_weight = spectral_weight
         self.rank_attn = rank_attn
+        self.arch_version = arch_version
+        assert self.arch_version in ["current", "legacy"]
 
         if fts_dim is not None and not poly:
             self.text_affine = FullyConnectedLayer(fts_dim, in_channels, activation='lrelu', lr_multiplier=0.01)
@@ -711,85 +772,77 @@ class SynthesisLayer(torch.nn.Module):
             self.text_ffc = FullyConnectedLayer(2*in_channels,in_channels,bias_init=1)
 
         if attn:
-            if res_channels != 3:
-                if channel_attn:
-                    kwargs = {
-                    "from_len":  in_channels,               "to_len":  k - 1,         # The from/to tensor lengths
-                    "from_dim":  self.resolution * rank * 2, "to_dim":  w_dim,         # The from/to tensor dimensions
-                    "from_gate": img_gate,                    "to_gate": ltnt_gate,     # Gate attention flow between from/to tensors
-                    }
-                elif rank_attn:
-                    kwargs = {
-                    # "from_len":  self.resolution * rank * 2,     "to_len":  k - 1,         # The from/to tensor lengths
-                    "from_len":  rank * 2,     "to_len":  k - 1,         # The from/to tensor lengths
-                    "from_dim":  in_channels,                "to_dim":  w_dim,         # The from/to tensor dimensions
-                    "from_gate": img_gate,                    "to_gate": ltnt_gate,     # Gate attention flow between from/to tensors
-                    }
+            if self.arch_version == "legacy":
+                if res_channels != 3:
+                    if channel_attn:
+                        kwargs = {
+                        "from_len":  out_channels,               "to_len":  k - 1,
+                        "from_dim":  self.resolution * rank * 2, "to_dim":  w_dim,
+                        "from_gate": img_gate,                   "to_gate": ltnt_gate,
+                        }
+                    else:
+                        kwargs = {
+                        "from_len":  self.resolution * rank * 2, "to_len":  k - 1,
+                        "from_dim":  out_channels,               "to_dim":  w_dim,
+                        "from_gate": img_gate,                   "to_gate": ltnt_gate,
+                        }
                 else:
                     kwargs = {
-                    "from_len":  self.resolution * rank * 2,     "to_len":  k - 1,         # The from/to tensor lengths
-                    "from_dim":  in_channels,                "to_dim":  w_dim,         # The from/to tensor dimensions
-                    "from_gate": img_gate,  
+                        "from_len":  resolution * resolution,    "to_len":  k - 1,
+                        "from_dim":  out_channels,               "to_dim":  w_dim,
+                        "from_gate": img_gate,                   "to_gate": ltnt_gate,
                     }
+                kwargs.update(transformer_kwargs)
+                kwargs["pos_dim"] = kwargs.get("pos_dim") or in_channels
+                self.transformer = TransformerLayer(dim = out_channels, **kwargs)
             else:
-                kwargs = {
-                    "from_len":  resolution * resolution,       "to_len":  k - 1,         # The from/to tensor lengths
-                    "from_dim":  in_channels,                "to_dim":  w_dim,         # The from/to tensor dimensions
-                    "from_gate": img_gate,                    "to_gate": ltnt_gate,     # Gate attention flow between from/to tensors
-                }
-                
-            # transformer_kwargs["pos_dim"] = out_channels
-            # grid_pos, params = get_positional_encoding(resolution, rank=rank, **transformer_kwargs)
-            # # Register positional encoding params/buffers
-            # if len(params) > 0:
-            #     self.grid_pos = grid_pos
-            #     for i, param in enumerate(params):
-            #         setattr(self, f"pos{i}", param)
-            # else:
-            #     self.register_buffer("grid_pos", grid_pos)
-            # self.affine = FullyConnectedLayer(resolution*rank*2, resolution*2, activation='lrelu', lr_multiplier=0.01)
-            # self.affine2 = FullyConnectedLayer(resolution*2, resolution*rank*2, activation='lrelu', lr_multiplier=0.01)
-            kwargs.update(transformer_kwargs)
-            # self.transformer = TransformerLayer(dim = in_channels, modulate = False, **kwargs)
-            self.transformer = TransformerLayer(dim = in_channels, **kwargs)
-            # self.ffc = FullyConnectedLayer(out_channels,out_channels,activation='lrelu')
-            # self.ff = torch.nn.Sequential(
-            #     torch.nn.GELU(),
-            #     torch.nn.Linear(out_channels, out_channels),
-            #     torch.nn.GELU(),
-            #     torch.nn.Linear(out_channels, out_channels),
-            # )
+                if res_channels != 3:
+                    if channel_attn:
+                        kwargs = {
+                        "from_len":  in_channels,               "to_len":  k - 1,         # The from/to tensor lengths
+                        "from_dim":  self.resolution * rank * 2, "to_dim":  w_dim,         # The from/to tensor dimensions
+                        "from_gate": img_gate,                    "to_gate": ltnt_gate,     # Gate attention flow between from/to tensors
+                        }
+                    elif rank_attn:
+                        kwargs = {
+                        "from_len":  rank * 2,     "to_len":  k - 1,         # The from/to tensor lengths
+                        "from_dim":  in_channels,                "to_dim":  w_dim,         # The from/to tensor dimensions
+                        "from_gate": img_gate,                    "to_gate": ltnt_gate,     # Gate attention flow between from/to tensors
+                        }
+                    else:
+                        kwargs = {
+                        "from_len":  self.resolution * rank * 2,     "to_len":  k - 1,         # The from/to tensor lengths
+                        "from_dim":  in_channels,                "to_dim":  w_dim,         # The from/to tensor dimensions
+                        "from_gate": img_gate,  
+                        }
+                else:
+                    kwargs = {
+                        "from_len":  resolution * resolution,       "to_len":  k - 1,         # The from/to tensor lengths
+                        "from_dim":  in_channels,                "to_dim":  w_dim,         # The from/to tensor dimensions
+                        "from_gate": img_gate,                    "to_gate": ltnt_gate,     # Gate attention flow between from/to tensors
+                    }
+                kwargs.update(transformer_kwargs)
+                self.transformer = TransformerLayer(dim = in_channels, **kwargs)
 
         if not poly:
-            self.affine = FullyConnectedLayer(w_dim, in_channels, bias_init=1)
-            
             if self.mod_fc:
                 memory_format = torch.channels_last if channels_last else torch.contiguous_format
-                if spectral_weight:
-                    # self.affine_spectral = FullyConnectedLayer(w_dim, in_channels + 2, bias_init=1)
-                    # self.weight1 = torch.nn.Parameter(torch.randn([out_channels, in_channels]).to(memory_format=memory_format))
-                    
-                    if self.spectral_weight == 'channel':
-                        # fft1 方法
-                        self.fc_new_weight = torch.nn.Parameter(torch.randn([out_channels // 2 + 1, in_channels + 2]).to(memory_format=memory_format))
-                        self.affine_spectral_new = FullyConnectedLayer(w_dim, in_channels + 2)
-                    elif self.spectral_weight == 'amplitude':
-                        # ffc2 方法
-                        self.affine_spectral = FullyConnectedLayer(w_dim, in_channels)
-                        self.h = nn.Parameter(torch.zeros(2, 1, 1))
-                        # self.weight = torch.nn.Parameter(torch.randn([in_channels], dtype=torch.float32).to(memory_format=memory_format))
-                    # # self.weight2 = torch.nn.Parameter(torch.randn([out_channels, in_channels, 2]).to(memory_format=memory_format))
-                    # self.affine = FullyConnectedLayer(w_dim, in_channels, bias_init=1)
-                    
-                    
-                    # self.affine = FullyConnectedLayer(w_dim, in_channels * 2, bias_init=1)
-                    # 
-                else:
-                    # self.affine = FullyConnectedLayer(w_dim, in_channels, bias_init=1)
+                if self.arch_version == "legacy":
+                    if spectral_weight:
+                        self.affine_spectral = FullyConnectedLayer(w_dim, in_channels, bias_init=1)
+                    self.affine = FullyConnectedLayer(w_dim, in_channels, bias_init=1)
                     self.weight = torch.nn.Parameter(torch.randn([out_channels, in_channels]).to(memory_format=memory_format))
-                # if spectral_weight:
-
-                #     self.complex_weight = torch.nn.Parameter(torch.randn([1, in_channels, 1, rank + 1, 2], dtype=torch.float32) * 0.02)
+                else:
+                    self.affine = FullyConnectedLayer(w_dim, in_channels, bias_init=1)
+                    if spectral_weight:
+                        if self.spectral_weight == 'channel':
+                            self.fc_new_weight = torch.nn.Parameter(torch.randn([out_channels // 2 + 1, in_channels + 2]).to(memory_format=memory_format))
+                            self.affine_spectral_new = FullyConnectedLayer(w_dim, in_channels + 2)
+                        elif self.spectral_weight == 'amplitude':
+                            self.affine_spectral = FullyConnectedLayer(w_dim, in_channels)
+                            self.h = nn.Parameter(torch.zeros(2, 1, 1))
+                    else:
+                        self.weight = torch.nn.Parameter(torch.randn([out_channels, in_channels]).to(memory_format=memory_format))
                     
             else:
                 self.adain = AdaptiveInstanceNorm(in_channels, in_channels, out_channels)
@@ -804,99 +857,117 @@ class SynthesisLayer(torch.nn.Module):
         assert noise_mode in ["random", "const", "none"]  # unused
         shape = x.shape
         res_factor = 1.0
-        
-        if self.attn:
-            # if x.shape[2] != self.resolution:
-            #     # 没用上
-            #     res_factor = self.resolution / x.shape[2]
-            #     x = F.interpolate(x, scale_factor=(1,res_factor), mode='bilinear')
+
+        if self.arch_version == "legacy":
             if not self.poly:
-                
-                if not self.channel_attn:
-                    if self.rank_attn:
-                        x = x.permute(0, 2, 3, 1) # b,c,r,2rank-> b,r,2rank,c
+                styles = self.affine(get_global(w))
+                if self.fts_dim is not None and fsts is not None:
+                    fsts = self.text_affine(fsts)
+                    fsts = self.text_affine2(fsts)
+                    styles = self.text_ffc(torch.cat([fsts,styles], dim=-1))
+                if self.mod_fc:
+                    if self.spectral_weight:
+                        styles2 = self.affine_spectral(styles if self.fts_dim is not None and fsts is not None else get_global(w))
+                        x = modulated_spectral_fc_legacy(x=x, weight=self.weight, styles=styles, styles2=styles2)
                     else:
-                        x = x.reshape(shape[0], self.in_channels, -1) # b,c,r,2rank -> b,c,r*2rank
-                        x = x.permute(0, 2, 1) # b,c,r*2rank-> b,r*2rank,c
-                    
-                x_,_,_ = self.transformer(
-                    from_tensor = x,  to_tensor = get_components(w.to(x.dtype)),
-                    # from_pos=self.grid_pos,
-                    from_pos=None,
-                    to_pos=None
-                )
-                if not self.channel_attn:
-                    if self.rank_attn:
-                        x = x_.permute(0, 3, 1, 2)
-                    else:
+                        x = modulated_fc(x=x, weight=self.weight, styles=styles)
+                else:
+                    x = self.adain(x, styles)
+            else:
+                x = x.reshape(shape[0], shape[1], -1).permute(0, 2, 1)
+                x, gird_new = self.poly_layer(x, get_global(w), grid)
+
+            if self.attn:
+                if x.shape[2] != self.resolution:
+                    res_factor = self.resolution / x.shape[2]
+                    x = F.interpolate(x, scale_factor=(1, res_factor), mode='bilinear')
+                if not self.poly:
+                    attn_shape = x.shape
+                    x = x.reshape(attn_shape[0], self.out_channels, -1)
+                    if not self.channel_attn:
+                        x = x.permute(0, 2, 1)
+                    x_,_,_ = self.transformer(
+                        from_tensor = x, to_tensor = get_components(w.to(x.dtype)),
+                        from_pos=None, to_pos=None
+                    )
+                    if not self.channel_attn:
                         x = x_.permute(0, 2, 1)
-                else:
-                    x = x_    
-
-                x = x.reshape(shape[0],self.in_channels,shape[2],shape[3])
-            else:
-                x_,_,_ = self.transformer(
-                    from_tensor = x,  to_tensor = get_components(w.to(x.dtype)),
-                    from_pos=None,to_pos=None
-                )
-                # b,R*rank*2,C -> b,C,R,rank*2
-                x = x_.permute(0, 2, 1)
-                x = x.reshape(shape[0],self.in_channels,self.resolution,-1)
-                
-            if res_factor != 1: # not used
-                res_factor_r = 1 / res_factor
-                x  = F.interpolate(x, scale_factor=(1,res_factor_r), mode='bilinear')
-
-        # 降维
-        if not self.poly:
-            styles = self.affine(get_global(w))
-            if self.fts_dim is not None and fsts is not None:
-                fsts = self.text_affine(fsts)
-                fsts = self.text_affine2(fsts)
-                styles = self.text_ffc(torch.cat([fsts,styles], dim=-1))
-            if self.mod_fc:
-                if self.spectral_weight:
-                    # styles = self.affine(get_global(w))
-                    if self.fts_dim is not None and fsts is not None:
-                        if self.spectral_weight == 'amplitude':
-                            # ffc2 
-                            styles2 = self.affine_spectral(styles)
-                        elif self.spectral_weight == 'channel':
-                            # ffc1 方法
-                            fc_new_styles2 = self.affine_spectral_new(styles)
-                        else:
-                            print("spectral_weight type error!")
                     else:
-                        if self.spectral_weight == 'amplitude':
-                            # ffc2 
-                            styles2 = self.affine_spectral(get_global(w))
-                        elif self.spectral_weight == 'channel':
-                            # ffc1 方法
-                            fc_new_styles2 = self.affine_spectral_new(get_global(w))
-                        else:
-                            print("spectral_weight type error!")
-                        
-                    # x = modulated_spectral_fc(x=x, weight1=self.weight1, styles=styles, styles2=styles2)
-                    if self.spectral_weight == 'channel':
-                        # fft1方法
-                        x = modulated_spectral_fc_new(x=x, 
-                                                  weight=self.fc_new_weight,
-                                                  styles2=fc_new_styles2)
-                    elif self.spectral_weight == 'amplitude':
-                        # fft2方法
-                        x = modulated_spectral_fc_frequency(x=x, 
-                                                            h = self.h,
-                                                            # weight=self.weight, weight2=self.weight2,
-                                                            styles2=styles2)
+                        x = x_
+                    x = x.reshape(attn_shape[0], self.out_channels, attn_shape[2], attn_shape[3])
                 else:
-                    x = modulated_fc(x=x, weight=self.weight, styles=styles)
-            else:
-                x = self.adain(x, styles)
-                # x = self.df(x, styles)
+                    x_,_,_ = self.transformer(
+                        from_tensor = x, to_tensor = get_components(w.to(x.dtype)),
+                        from_pos=None, to_pos=None
+                    )
+                    x = x_.permute(0, 2, 1)
+                    x = x.reshape(shape[0], self.out_channels, self.resolution, -1)
+                if res_factor != 1:
+                    x = F.interpolate(x, scale_factor=(1, 1 / res_factor), mode='bilinear')
         else:
-            # B,C,R,2*rank -> B,R*2*rank,C
-            x = x.reshape(shape[0], shape[1], -1).permute(0, 2, 1)
-            x, gird_new = self.poly_layer(x,get_global(w),grid)
+            if self.attn:
+                if not self.poly:
+                    if not self.channel_attn:
+                        if self.rank_attn:
+                            x = x.permute(0, 2, 3, 1)
+                        else:
+                            x = x.reshape(shape[0], self.in_channels, -1)
+                            x = x.permute(0, 2, 1)
+                    x_,_,_ = self.transformer(
+                        from_tensor = x, to_tensor = get_components(w.to(x.dtype)),
+                        from_pos=None, to_pos=None
+                    )
+                    if not self.channel_attn:
+                        if self.rank_attn:
+                            x = x_.permute(0, 3, 1, 2)
+                        else:
+                            x = x_.permute(0, 2, 1)
+                    else:
+                        x = x_
+                    x = x.reshape(shape[0], self.in_channels, shape[2], shape[3])
+                else:
+                    x_,_,_ = self.transformer(
+                        from_tensor = x, to_tensor = get_components(w.to(x.dtype)),
+                        from_pos=None, to_pos=None
+                    )
+                    x = x_.permute(0, 2, 1)
+                    x = x.reshape(shape[0], self.in_channels, self.resolution, -1)
+                if res_factor != 1:
+                    x = F.interpolate(x, scale_factor=(1, 1 / res_factor), mode='bilinear')
+
+            if not self.poly:
+                styles = self.affine(get_global(w))
+                if self.fts_dim is not None and fsts is not None:
+                    fsts = self.text_affine(fsts)
+                    fsts = self.text_affine2(fsts)
+                    styles = self.text_ffc(torch.cat([fsts,styles], dim=-1))
+                if self.mod_fc:
+                    if self.spectral_weight:
+                        if self.fts_dim is not None and fsts is not None:
+                            if self.spectral_weight == 'amplitude':
+                                styles2 = self.affine_spectral(styles)
+                            elif self.spectral_weight == 'channel':
+                                fc_new_styles2 = self.affine_spectral_new(styles)
+                            else:
+                                print("spectral_weight type error!")
+                        else:
+                            if self.spectral_weight == 'amplitude':
+                                styles2 = self.affine_spectral(get_global(w))
+                            elif self.spectral_weight == 'channel':
+                                fc_new_styles2 = self.affine_spectral_new(get_global(w))
+                            else:
+                                print("spectral_weight type error!")
+                        if self.spectral_weight == 'channel':
+                            x = modulated_spectral_fc_new(x=x, weight=self.fc_new_weight, styles2=fc_new_styles2)
+                        elif self.spectral_weight == 'amplitude':
+                            x = modulated_spectral_fc_frequency(x=x, h=self.h, styles2=styles2)
+                    else:
+                        x = modulated_fc(x=x, weight=self.weight, styles=styles)
+                else:
+                    x = self.adain(x, styles)
+            else:
+                x = x.reshape(shape[0], shape[1], -1).permute(0, 2, 1)
+                x, gird_new = self.poly_layer(x, get_global(w), grid)
         
                     
         act_gain = self.act_gain * gain
@@ -1181,6 +1252,7 @@ class ToResLayer(torch.nn.Module):
                  attn_res = True, rank=8, fts_dim = None,
                  fc_clamp=None, channels_last=False,
                  spectral_weight = False,
+                 arch_version = "current",
                  ltnt_gate = False,        # Gate attention from latents, such that components may not send information
                                         # when gate value is low
                  img_gate = False,        # Gate attention for images, such that some image positions may not get updated
@@ -1194,6 +1266,8 @@ class ToResLayer(torch.nn.Module):
         self.attn_res = attn_res
         self.fts_dim = fts_dim
         self.spectral_weight = spectral_weight
+        self.arch_version = arch_version
+        assert self.arch_version in ["current", "legacy"]
         
         # 先修改了spectral_weight，2023年09月08日
         if fts_dim is not None:
@@ -1214,30 +1288,30 @@ class ToResLayer(torch.nn.Module):
                     "from_gate": img_gate,                    "to_gate": ltnt_gate,     # Gate attention flow between from/to tensors
                 }
             # self.pe,_ = get_positional_encoding(resolution, in_channels,rank=rank)
-            self.transformer = TransformerLayer(dim = out_channels, modulate = False, **kwargs)
+            if self.arch_version == "legacy":
+                self.transformer = TransformerLayer(dim = out_channels, **kwargs)
+            else:
+                self.transformer = TransformerLayer(dim = out_channels, modulate = False, **kwargs)
             # self.transformer = TransformerLayer(dim = out_channels,pos_dim=in_channels,**kwargs)
             # self.ffc = EqualLinear(in_channels,out_channels)
 
         self.fc_clamp = fc_clamp
         
         memory_format = torch.channels_last if channels_last else torch.contiguous_format
-        if self.spectral_weight:
-            self.affine = FullyConnectedLayer(w_dim, in_channels, bias_init=1)
-            self.weight = torch.nn.Parameter(torch.randn([out_channels, in_channels]).to(memory_format=memory_format))
-            self.weight_gain = 1 / np.sqrt(in_channels)
+        if self.arch_version == "legacy":
+            if not self.spectral_weight:
+                self.affine = FullyConnectedLayer(w_dim, in_channels, bias_init=1)
+                self.weight = torch.nn.Parameter(torch.randn([out_channels, in_channels]).to(memory_format=memory_format))
+                self.weight_gain = 1 / np.sqrt(in_channels)
+            else:
+                self.affine = FullyConnectedLayer(w_dim, in_channels * 2, bias_init=1)
+                self.weight = torch.nn.Parameter(torch.randn([out_channels, in_channels * 2]).to(memory_format=memory_format))
+                self.weight_gain = 1 / np.sqrt(in_channels * 2)
         else:
-            # TODO
             self.affine = FullyConnectedLayer(w_dim, in_channels, bias_init=1)
             self.weight_gain = 1 / np.sqrt(in_channels)
-            
-            # self.affine_spectral = FullyConnectedLayer(w_dim, in_channels + 2, bias_init=1)
-            # self.weight = torch.nn.Parameter(torch.randn([out_channels, in_channels]).to(memory_format=memory_format))
-            
             self.affine_spectral_new = FullyConnectedLayer(w_dim, in_channels + 2, bias_init=1)
             self.weight = torch.nn.Parameter(torch.randn([out_channels // 2 + 2, in_channels + 2]).to(memory_format=memory_format))
-            # self.affine = FullyConnectedLayer(w_dim, in_channels * 2, bias_init=1)
-            # self.weight = torch.nn.Parameter(torch.randn([out_channels, in_channels * 2]).to(memory_format=memory_format))
-            # self.weight_gain = 1 / np.sqrt(in_channels * 2)
         self.bias = torch.nn.Parameter(torch.zeros([out_channels]))
         
 
@@ -1247,19 +1321,15 @@ class ToResLayer(torch.nn.Module):
             fsts = self.text_affine(fsts)
             fsts = self.text_affine2(fsts)
             styles = self.text_ffc(torch.cat([fsts,styles], dim=-1))
-        if self.spectral_weight:
-            x = modulated_fc(x=x, weight=self.weight, styles=styles, demodulate=False)
-        else:
-            if self.fts_dim is not None and fsts is not None:
-                # styles2 = self.affine_spectral(styles)
-                styles2 = self.affine_spectral_new(styles)
+        if self.arch_version == "legacy":
+            if not self.spectral_weight:
+                x = modulated_fc(x=x, weight=self.weight, styles=styles, demodulate=False)
             else:
-                # styles2 = self.affine_spectral(get_global(w))
-                styles2 = self.affine_spectral_new(get_global(w))
-                
+                x = modulated_spectral_fc_new(x=x, weight=self.weight, styles2=styles)
+        else:
+            styles2 = self.affine_spectral_new(styles if self.fts_dim is not None and fsts is not None else get_global(w))
             x = modulated_spectral_fc_new(x=x, weight=self.weight, styles2=styles2)
-            x = x[:,:self.out_channels] # for situation that out_channels=3
-            # x = modulated_spectral_fc(x=x, weight1=self.weight, styles=styles, styles2=styles2)
+            x = x[:,:self.out_channels]
         
         if self.attn_res:
             shape = x.shape
@@ -1306,6 +1376,7 @@ class SynthesisBlock(torch.nn.Module):
         fp16_channels_last=False,  # Use channels-last memory format with FP16?
         poly = False,
         spectral_weight = False,
+        arch_version = "current",
         **layer_kwargs,  # Arguments for SynthesisLayer.
     ):
         assert architecture in ["orig", "skip"]
@@ -1323,13 +1394,12 @@ class SynthesisBlock(torch.nn.Module):
         self.num_fc = 0
         self.num_tores = 0
         self.poly = poly
+        self.arch_version = arch_version
 
         if in_channels == 1:
             if poly is False:
                 self.input = SynthesisInput(out_channels, w_dim=w_dim, resolution=resolution,
                                             attn=False, rank=rank)
-                # self.input = SynthesisInputSin(out_channels, w_dim=w_dim, resolution=resolution,
-                #                             attn=False, rank=rank)
             else:
                 self.input = PolyInput(out_channels, w_dim=w_dim, resolution=resolution, rank=rank)
             self.fc1 = SynthesisLayer(
@@ -1345,6 +1415,7 @@ class SynthesisBlock(torch.nn.Module):
                 channels_last=self.channels_last,
                 res_channels = res_channels,
                 spectral_weight = spectral_weight,
+                arch_version = arch_version,
                 **layer_kwargs,
             )
 
@@ -1362,6 +1433,7 @@ class SynthesisBlock(torch.nn.Module):
                 channels_last=self.channels_last,
                 res_channels = res_channels,
                 spectral_weight = spectral_weight,
+                arch_version = arch_version,
                 **layer_kwargs,
             )
             self.num_fc += 1
@@ -1378,6 +1450,7 @@ class SynthesisBlock(torch.nn.Module):
                 channels_last=self.channels_last,
                 res_channels = res_channels,
                 spectral_weight = spectral_weight,
+                arch_version = arch_version,
                 **layer_kwargs,
             )
         self.num_fc += 1
@@ -1396,7 +1469,8 @@ class SynthesisBlock(torch.nn.Module):
                 resolution = resolution,
                 fc_clamp=fc_clamp,
                 channels_last=self.channels_last,
-                spectral_weight = False,
+                spectral_weight = spectral_weight if self.arch_version == "legacy" else False,
+                arch_version = arch_version,
             )
             self.num_tores += 1
 
@@ -1472,6 +1546,7 @@ class SynthesisNetwork(torch.nn.Module):
         num_fp16_res=0,  # Use FP16 for the N highest resolutions.
         poly = True,
         spectral_weight = False,
+        arch_version = "current",
         **block_kwargs,  # Arguments for SynthesisBlock.
     ):
         assert img_resolution >= 4 and img_resolution & (img_resolution - 1) == 0
@@ -1480,13 +1555,14 @@ class SynthesisNetwork(torch.nn.Module):
         self.w_dim = w_dim
         self.k = k
         self.img_resolution = img_resolution
-        self.final_img_resolution = final_img_resolution
-        self.img_resolution_log2 = int(np.log2(final_img_resolution))
+        self.final_img_resolution = img_resolution if arch_version == "legacy" else final_img_resolution
+        self.img_resolution_log2 = int(np.log2(self.final_img_resolution))
         self.img_channels = img_channels
         self.biline_channels = biline_channels
         self.num_fp16_res = num_fp16_res
         self.block_resolutions = [2**i for i in range(2, self.img_resolution_log2 + 1)]
         self.poly = poly
+        self.arch_version = arch_version
         channels_dict = {res: min(channel_base // res, channel_max) for res in self.block_resolutions}
         fp16_resolution = max(2 ** (self.img_resolution_log2 + 1 - num_fp16_res), 8)
 
@@ -1509,6 +1585,7 @@ class SynthesisNetwork(torch.nn.Module):
                 use_fp16=use_fp16,
                 poly = poly,
                 spectral_weight = spectral_weight,
+                arch_version = arch_version,
                 **block_kwargs,
             )
             self.num_ws += block.num_fc
@@ -1547,8 +1624,8 @@ class SynthesisNetwork(torch.nn.Module):
             # use_fp16=False,
             fc_clamp=256,
             poly = False,
-            # spectral_weight = spectral_weight,
-            spectral_weight = False,
+            spectral_weight = spectral_weight if self.arch_version == "legacy" else False,
+            arch_version = arch_version,
         )
         self.block1 = SynthesisBlock(
             biline_channels * 4,
@@ -1564,8 +1641,8 @@ class SynthesisNetwork(torch.nn.Module):
             # use_fp16=False,
             fc_clamp=256,
             poly = False,
-            # spectral_weight = spectral_weight,
-            spectral_weight = False,
+            spectral_weight = spectral_weight if self.arch_version == "legacy" else False,
+            arch_version = arch_version,
         )
 
     def forward(self, ws, coords, fsts=None, **block_kwargs):
@@ -1637,6 +1714,7 @@ class Generator(torch.nn.Module):
         min_resolution=0.5,
         max_resolution=1.0,
         mapping_kwargs={},  # Arguments for MappingNetwork.
+        arch_version="current",
         **synthesis_kwargs,  # Arguments for SynthesisNetwork.
     ):
         super().__init__()
@@ -1662,10 +1740,20 @@ class Generator(torch.nn.Module):
             k = k,
             img_resolution=img_resolution,
             img_channels=img_channels,
+            arch_version=arch_version,
             **synthesis_kwargs,
         )
         self.num_ws = self.synthesis.num_ws
-        self.mapping = MappingNetwork(z_dim=z_dim, c_dim=c_dim, w_dim=w_dim, fts_dim=fts_dim, k=k, num_broadcast=self.num_ws, **mapping_kwargs)
+        self.mapping = MappingNetwork(
+            z_dim=z_dim,
+            c_dim=c_dim,
+            w_dim=w_dim,
+            fts_dim=fts_dim,
+            k=k,
+            num_broadcast=self.num_ws,
+            arch_version=arch_version,
+            **mapping_kwargs,
+        )
         # self.mapping = MappingNetwork(z_dim=z_dim, c_dim=c_dim, w_dim=w_dim, fts_dim=fts_dim, k=k, num_ws=self.num_ws, **mapping_kwargs)
         # self.mapping = MappingNetwork(z_dim=z_dim, c_dim=c_dim, w_dim=w_dim,fts_dim=0, num_ws=self.num_ws, **mapping_kwargs)
 

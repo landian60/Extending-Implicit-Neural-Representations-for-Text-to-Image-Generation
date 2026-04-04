@@ -107,7 +107,38 @@ def slugify_text(text: str) -> str:
     return slug.strip("-") or "prompt"
 
 
+def resolve_query_points(
+    startpoints: List[Tuple[float, float]], startw: float, starth: float
+) -> List[Tuple[float, float]]:
+    """Use explicit startpoints when provided, otherwise fall back to one window."""
+    return startpoints if len(startpoints) > 0 else [(startw, starth)]
+
+
+def get_tile_crop_ratio(mode: str, height: float) -> float:
+    """Crop each generated tile before building the preview mosaic.
+
+    The current CLI produces a simple tiled preview rather than a geometry-aware stitch.
+    These crop ratios preserve the previous visualization behavior.
+    """
+    if mode == "interpolation":
+        return 1 / height / 2
+    if mode == "extrapolation":
+        return 1 / height
+    raise ValueError(f"unsupported mode: {mode}")
+
+
+def crop_preview_tile(img: PIL.Image.Image, crop_ratio: float) -> PIL.Image.Image:
+    """Center-crop the visible portion used in the combined preview image."""
+    crop_w = int(img.width * crop_ratio)
+    crop_h = int(img.height * crop_ratio)
+    return img.crop((0, 0, crop_w, crop_h))
+
+
 def combine_tiles(img_list: List[PIL.Image.Image]) -> PIL.Image.Image:
+    """Build a simple row-major contact sheet from individually rendered windows.
+
+    This is intentionally a lightweight preview mosaic, not a geometry-aware stitch.
+    """
     if len(img_list) == 1:
         return img_list[0]
 
@@ -219,7 +250,7 @@ def combine_tiles(img_list: List[PIL.Image.Image]) -> PIL.Image.Image:
     "--startpoints",
     type=parse_start_points,
     default="",
-    help="Optional list of start points for image generation. When omitted, --starth/--startw define a single window.",
+    help="Optional list of start points for multi-window generation. When omitted, --starth/--startw define a single window.",
 )
 def generate_images(
     network_pkl: str,
@@ -276,13 +307,16 @@ def generate_images(
         f_txt = txt_emb.to(device)
         f_txt /= f_txt.norm(dim=-1, keepdim=True)
 
-    query_points = startpoints if len(startpoints) > 0 else [(startw, starth)]
+    # Each query point renders one fixed-resolution window. When multiple points are
+    # provided, the script saves both the individual tiles and a simple combined mosaic.
+    query_points = resolve_query_points(startpoints, startw, starth)
+    tile_crop_ratio = get_tile_crop_ratio(mode, height)
 
     for seed_idx, seed in enumerate(seeds):
         print("Generating image for seed %d (%d/%d) ..." % (seed, seed_idx, len(seeds)))
         z = torch.from_numpy(np.random.RandomState(seed).randn(1, *G.input_shape[1:])).to(device)
         z = z.float()
-        img_list = []
+        tile_images = []
         # if hasattr(G.synthesis, "input"):
         #     m = make_transform(translate, rotate)
         #     m = np.linalg.inv(m)
@@ -294,23 +328,21 @@ def generate_images(
         #     # 第一次是-1,2；第二、三次是-0.5,1.5
         #     G.synthesis.b4.input.coords = make_coords(G.img_resolution, scale).to(device)
         # print("startpoints",startpoints)
-        if mode == "interpolation":
-            sca = 1 / height / 2
-        elif mode == "extrapolation":
-            sca = 1 / height
         for startpoint in query_points:
             startw_, starth_ = startpoint
             print(startw_, starth_)
+            # Keep the queried coordinate count fixed at the training-time image
+            # resolution and move the queried window via start_h/start_w/height.
             coords = G.head_pos_enc.make_grid2d(n_height=G.img_resolution,n_width=G.img_resolution,start_h=starth_,start_w=startw_, # start_h和start_w是相对于原图的起始点位置
                         width=height, height=height)
             # coords = coords
             img = G(z, label, fsts=f_sent, fts=f_txt, coords=coords, truncation_psi=truncation_psi, noise_mode=noise_mode)
             img = (img.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
             img_pil = PIL.Image.fromarray(img[0].cpu().numpy(), "RGB")
-            img_list.append(img_pil.crop((0, 0, int(img_pil.width * sca), int(img_pil.height * sca))))
+            tile_images.append(crop_preview_tile(img_pil, tile_crop_ratio))
             img_pil.save(f"{outdir}/{mode}-starth{starth_}-startw{startw_}-size{height}-seed{seed:04d}-text-{prompt_slug}.png")
 
-        combined_img = combine_tiles(img_list)
+        combined_img = combine_tiles(tile_images)
         combined_img.save(f"{outdir}/combined-seed{seed:04d}-text-{prompt_slug}.png")
 
 # ----------------------------------------------------------------------------

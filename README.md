@@ -5,7 +5,8 @@
 4. [Preparing Datasets](#preparing-datasets)
 5. [Training](#training)
 6. [Quality Metrics](#quality-metrics)
-7. [Acknowledgements](#acknowledgements)
+7. [Model Checkpoints](#model-checkpoints)
+8. [Acknowledgements](#acknowledgements)
 
 # Extending Implicit Neural Representations for Text-to-Image Generation
 <a href="https://doi.org/10.1109/ICASSP48485.2024.10446171"><img src="https://img.shields.io/badge/DOI-10.1109%2FICASSP48485.2024.10446171-blue?style=for-the-badge"></a>
@@ -46,7 +47,8 @@ Details of the model architecture and experimental results can be found in [our 
 ## Additional material
 
 - This repository is a **minimal open-source migration** that keeps the core EIDGAN training, sampling, and evaluation path.
-- This release does **not** include checkpoints, notebooks, internal shell scripts, experiment logs, or the full paper PDF.
+- Public model checkpoints are provided separately through Google Drive.
+- This release does **not** include notebooks, internal shell scripts, experiment logs, or the full paper PDF.
 - The README figures are cropped from the published ICASSP 2024 paper for repository presentation.
 - Related upstream projects:
   - [CREPS](https://github.com/thuanz123/creps)
@@ -93,10 +95,17 @@ Method-specific controls:
 - `--startpoints`: a list of coordinate offsets used to query multiple coordinate windows from the same continuous image field.
 - `--starth` / `--startw`: starting offsets for a single queried region.
 
+Current generation behavior:
+
+- Without `--startpoints`, `gen_images.py` renders a single queried window controlled by `--starth` and `--startw`.
+- With `--startpoints`, the script renders one fixed-resolution window per start point, saves every tile separately, and also writes a `combined-seedXXXX-...png` preview image.
+- The current `combined` image is a simple row-major mosaic of cropped tiles. It is intended as a lightweight stitched preview, not as a geometry-aware compositor.
+- In other words, the public script currently supports multi-window tiled generation, but not true single-pass dense-grid upsampling.
+
 Typical EIDGAN controls from the paper:
 
 ```bash
-# High-resolution, scale-consistent interpolation at 2x resolution.
+# Larger-field, scale-consistent interpolation shown as a 2x tiled preview.
 python gen_images.py --network=/path/to/network-snapshot.pkl \
     --outdir=out --text="a baseball player preparing to throw the baseball" \
     --seeds=2 --mode=interpolation --height=1.0 \
@@ -108,6 +117,12 @@ python gen_images.py --network=/path/to/network-snapshot.pkl \
     --seeds=2 --mode=extrapolation --height=1.0 \
     --startpoints="(-0.5,-0.5),(-0.5,0.5),(0.5,-0.5),(0.5,0.5)"
 ```
+
+Practical note:
+
+- For larger outputs in the current public release, prefer tiled generation via `--startpoints`.
+- Each tile keeps the original queried coordinate count and shifts the queried window instead of increasing the token count in one forward pass.
+- If you need a geometry-aware final stitch, treat the saved per-tile images as the primary output and adapt the compositor to your window layout.
 
 ## Using Networks from Python
 
@@ -121,7 +136,7 @@ import torch
 with dnnlib.util.open_url("network-snapshot.pkl") as f:
     G = legacy.load_network_pkl(f)["G_ema"].cuda()
 
-z = torch.randn([1, G.z_dim], device="cuda")
+z = torch.randn([1, G.k, G.z_dim], device="cuda")
 c = torch.zeros([1, G.c_dim], device="cuda")
 ```
 
@@ -199,6 +214,32 @@ Available metrics:
 * `clipsim`: CLIP similarity between generated images and prompts.
 * `clipRprecision`: CLIP-R precision on generated images.
 * `clipRprecisionTrue`: CLIP-R precision on the real dataset.
+
+## Model Checkpoints
+
+Public EIDGAN network checkpoints are available at:
+
+- [Google Drive folder](https://drive.google.com/drive/folders/17Rh3vkbpXLLx-0jPdqWwPDzfv77bxdXJ?usp=sharing)
+
+After downloading, pass the local `.pkl` path to `--network`.
+
+Example usage:
+
+```bash
+# Generate images from a downloaded checkpoint.
+python gen_images.py --network=/path/to/network-snapshot.pkl \
+    --outdir=out --text="a bird with a yellow belly and a short beak" --seeds=0-3
+
+# Run tiled interpolation / extrapolation with the downloaded checkpoint.
+python gen_images.py --network=/path/to/network-snapshot.pkl \
+    --outdir=out --text="a baseball player preparing to throw the baseball" \
+    --seeds=2 --mode=interpolation --height=1.0 \
+    --startpoints="(0.0,0.0),(0.0,0.5),(0.5,0.0),(0.5,0.5)"
+
+# Evaluate a downloaded checkpoint.
+python calc_metrics.py --metrics=fid50k_full,clipsim \
+    --network=/path/to/network-snapshot.pkl --data=/path/to/dataset/root
+```
 
 ## Acknowledgements
 
