@@ -1,0 +1,11 @@
+*.ckpt
+*.npz
+*.pkl
+*.pt
+*.pth
+*.zip
+.DS_Store
+__pycache__/
+out/
+training-runs/
+*.tfevents*

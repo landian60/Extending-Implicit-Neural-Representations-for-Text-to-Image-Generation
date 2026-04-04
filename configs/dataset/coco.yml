@@ -1,0 +1,31 @@
+dataset_name: 'coco'
+data_dir: 'data/coco'
+
+resolution: 64
+manual_seed: 100
+cuda: True
+
+multiscale: True
+multiscale_chance: 0.20
+extra_scale: 2
+min_resolution: 0.5
+max_resolution: 1.0
+
+fts_dim: 512
+metric_only_test: True
+cache_dir: null
+
+lam: 0
+temp: 0.1
+itd: 5.0
+itc: 10.0
+gather: False
+
+batch_gpu: 16
+snap: 50
+kimg: 7200
+
+description: rslt64-open-source
+npz_path: null
+
+multi_gpus: True

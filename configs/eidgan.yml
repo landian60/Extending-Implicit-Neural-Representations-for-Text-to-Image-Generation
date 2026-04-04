@@ -1,0 +1,40 @@
+generator:
+  z_dim: 64
+  w_dim: 128
+  fp32: false # 在train改
+  fmaps: 8
+  attn: True # 非tores
+  rank_attn: True
+  channel_attn: False
+  attn_res: False # res的w和特征图的cross attn
+  selfattn: False # self attn 3
+  poly: False
+  mod_fc: True #是否独立预测每个像素,否的话为Adain,之前df(no)
+  k: 16
+  
+  spectral_weight: False # False, "channel", "amplitude"
+
+  # mapping
+  transformer: True
+  resnet: False # global_mlp 
+  # reshape in MLP,原因是FullyConnectedLayer需要二维输入，batch方式（sa为False）为
+  # [B*15,512],没啥问题
+  shared: False # 和sa初始化差有关系,k之间是否间隔开，但是如果设为True就不会做sa在mapping了
+  ltnt2ltnt: False # Add self-attention over latents in the mapping network
+  # transformer_kwargs 
+  integration: "both" # Feature integration type: additive, multiplicative or both (add, mul, both)
+  norm: instance # Feature normalization type (optional): instance, layer, None
+  num_heads: 8
+  # mapping_net_n_layers: 2
+  # attention_ftsdim: 512
+
+loss_kwargs:
+  r1_gamma: 10.0
+  pl_weight: 0 # 在train改
+  style_mixing_prob: 0.0
+
+discriminator:
+  fmaps: 1
+  d_use_norm: True
+  d_use_fts: True
+  wavelet: True # c.D_kwargs.block_kwargs

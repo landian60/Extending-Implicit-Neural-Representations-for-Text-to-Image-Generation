@@ -1,0 +1,29 @@
+name: eidgan
+channels:
+  - pytorch
+  - nvidia
+dependencies:
+  - python >= 3.8
+  - pip
+  - numpy>=1.20
+  - click>=8.0
+  - pillow=8.3.1
+  - scipy=1.7.1
+  - pytorch=1.9.1
+  - torchvision
+  - cudatoolkit=11.1
+  - pandas
+  - scikit-learn
+  - requests=2.26.0
+  - tqdm=4.62.2
+  - ninja=1.10.2
+  - matplotlib=3.4.2
+  - imageio=2.9.0
+  - pip:
+    - einops
+    - ftfy
+    - gitpython
+    - hydra-core==1.0.6
+    - omegaconf
+    - protobuf>=3.20
+    - pyspng
